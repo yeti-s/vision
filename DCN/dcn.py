@@ -8,6 +8,42 @@ import torchvision.ops as ops
 from torch.nn.common_types import _size_2_t
 from torch.nn.init import xavier_uniform_, constant_
 
+class TorchDeformConv2d(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size = 3, stride = 1, padding = 1, bias = False):
+        super(TorchDeformConv2d, self).__init__()
+
+        self.padding = padding
+
+        self.offset_conv = nn.Conv2d(in_channels, 
+                                     2 * in_channels * kernel_size * kernel_size,
+                                     kernel_size=kernel_size, 
+                                     stride=stride,
+                                     padding=self.padding, 
+                                     bias=True)
+        nn.init.constant_(self.offset_conv.weight, 0.)
+        nn.init.constant_(self.offset_conv.bias, 0.)
+
+        self.modulation_conv = nn.Conv2d(in_channels,
+                        in_channels * kernel_size * kernel_size,
+                        kernel_size=kernel_size,
+                        stride=stride,
+                        padding=self.padding,
+                        bias=True)
+        # nn.init.constant_(self.modulation_conv.weight, 1.0)
+        # nn.init.constant_(self.modulation_conv.bias, 0.0)
+
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, stride=stride, padding=padding, bias=bias)
+
+
+    def forward(self, x):
+        _, _, h, w = x.size()
+        max_offset = max(h, w) / 4 
+
+        offset = self.offset_conv(x).clamp(-max_offset, max_offset)
+        modulation = self.modulation_conv(x)
+        x = ops.deform_conv2d(x, offset, self.conv.weight, self.conv.bias, padding=self.padding, mask=modulation)
+
+        return x
 
 class DeformConv2d(nn.Conv2d):
     def __init__(self, in_channels: int, out_channels: int, kernel_size: int, stride: _size_2_t = 1, padding: _size_2_t = 0, bias=True) -> None:
@@ -96,6 +132,59 @@ class DeformConv2d(nn.Conv2d):
         values = values.view(b, c, N, h, w)
         return values
 
+
+class DeformConv(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int, stride: int = 1, padding: int = 0, bias=True) -> None:
+        super(DeformConv, self).__init__()
+
+        self.kernel_size = kernel_size
+        N = kernel_size ** 2
+        
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, stride=kernel_size, padding=padding, bias=bias)
+
+        self.offset_conv = nn.Conv2d(in_channels, 2*N, kernel_size, stride=stride, padding=1, bias=True)
+        nn.init.constant_(self.offset_conv.weight, 0)
+        nn.init.constant_(self.offset_conv.bias, 0)
+
+        self.modulation_conv = nn.Conv2d(in_channels, N, kernel_size, stride=stride, padding=1, bias=True)
+        # nn.init.constant_(self.offset_conv.weight, 1.0)
+        # nn.init.constant_(self.offset_conv.bias, 0)
+
+
+    def forward(self, x):
+        b, c, h, w = x.size()
+        ks = self.kernel_size
+        N = ks ** 2
+
+        # (b, 2N, h, w)
+        offset = self.offset_conv(x)
+        # (b, N, h, w)
+        x_offset = offset[:,:N,...]
+        y_offset = offset[:,N:,...]
+        
+        # create grid
+        index = torch.meshgrid([torch.linspace(-1.0, 1.0, h, device=offset.device), torch.linspace(-1.0, 1.0, w, device=offset.device)])
+        x_index = index[1]
+        y_index = index[0]
+
+        # (b, N, h, w)
+        x_coord = (x_offset + x_index).clamp_(-1.0, 1.0)
+        y_coord = (y_offset + y_index).clamp_(-1.0, 1.0)
+        
+        coord = torch.stack((x_coord, y_coord), dim=-1)
+        # (N, b, c, h, w, 2)
+        coord = coord.permute(1,0,2,3,4)
+
+        interpolated = torch.stack([nn.functional.grid_sample(x, coord[i], mode='bilinear', align_corners=True) for i in range(9)], dim=1)
+    
+        # (c, b, N, h, w)
+        interpolated = interpolated.permute(2, 0, 1, 3, 4)
+        modulation = self.modulation_conv(x)
+        interpolated = interpolated * modulation
+        interpolated = interpolated.permute(1, 0, 2, 3, 4)
+        
+        interpolated = torch.cat([torch.cat([interpolated[:,:,(i+j*3),...] for i in range(3)], dim=-1) for j in range(3)], dim=2)
+        return nn.functional.conv2d(interpolated, self.conv.weight, self.conv.bias, dilation=(h+1, w+1), padding=self.conv.padding)
 
 class DefromConvV3(nn.Module):
     def __init__(self, in_channels: int, out_channels: int, groups: int, kernel_size: int = 3, stride: _size_2_t = 1, padding: _size_2_t = 1, bias=True) -> None:
