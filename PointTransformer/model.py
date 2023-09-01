@@ -1,7 +1,9 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import knn_cuda
 
+DEFAULT_KNN_BUFFER_SIZE = 1000000000
 
 def get_points(points, idx):
     raw_size = idx.size()
@@ -25,9 +27,31 @@ def farthest_point_sampling(points, n_points):
         
     return sampled
 
-def knn_point_sampling(points, k):
-    distance = torch.cdist(points, points) # (b, n, d_points)
-    return distance.argsort()[:,:,:k]
+
+def knn_point_sampling(ref, query, k, buffer_size = DEFAULT_KNN_BUFFER_SIZE):
+    device = ref.device
+    ref = ref.cuda()
+    query = query.cuda()
+    
+    r_b, r_n, _ = ref.size()
+    q_b, q_n, _ = query.size()
+    batch_size = buffer_size // (r_b * r_n * q_b)
+
+    s_idx = 0
+    e_idx = batch_size
+    knn = knn_cuda.KNN(k, True)
+    knn_idx_list = []
+    while s_idx < q_n:
+        e_idx = q_n if e_idx > q_n else e_idx
+        
+        _, knn_idx = knn(ref, query[:,])
+        knn_idx_list.append(knn_idx)
+        # torch.cuda.empty_cache()
+        
+        s_idx = q_n
+        e_idx += batch_size
+    
+    return torch.concatenate(knn_idx_list, dim=1).to(device)
 
 class SingleMLP(nn.Module):
     def __init__(self, d_feats, d_points = 3) -> None:
@@ -68,7 +92,7 @@ class PointTransformerLayer(nn.Module):
     # feats (b, n, d_feats), points (b, n, d_points)
     def forward(self, feats, points):
 
-        knn_idx = knn_point_sampling(points, self.k) # (b, n, k)
+        knn_idx = knn_point_sampling(points, points, self.k) # (b, n, k)
         knn_feats = get_points(feats, knn_idx) # (b, n, k, d_feats)
         knn_points = get_points(points, knn_idx) # (b, n, k, d_points)
         
@@ -155,23 +179,19 @@ class TransitionDown(nn.Module):
     def forward(self, feats, points):
         b, n, in_feats = feats.size()
         
-        knn_idx = knn_point_sampling(points, self.k) # (b, n, k)
-        knn_points = get_points(points, knn_idx) # (b, n, k, d_points)
-        knn_feats = get_points(feats, knn_idx) # (b, n, k, in_feats)
-        
+        # farthest point sampling
         n_points = n // 4
         p2_idx = farthest_point_sampling(points, n_points) # (b, n_points)
         p2_points = get_points(points, p2_idx)
-        # (b, n, k, d_points) , (b, n, k, d_feats)
-        knn_p2_points = torch.gather(knn_points, 1, p2_idx.view(b, n_points, 1, 1).expand(-1, -1, self.k, self.d_points))
-        knn_p2_feats = torch.gather(knn_feats, 1, p2_idx.view(b, n_points, 1, 1).expand(-1, -1, self.k, in_feats))
-        
+        # knn of sampled points
+        knn_idx = knn_point_sampling(points, p2_points, self.k) # (b, n_points, k)
+        p2_knn_points = get_points(points, knn_idx) # (b, n_points, k, d_points)
+        p2_knn_feats = get_points(feats, knn_idx) # (b, n_points, k, in_feats)
         # why (d_points + in_feats) ?
-        x = torch.concatenate([knn_p2_points, knn_p2_feats], dim=-1) # (b, n_points, k, d_points + in_feats)
+        x = torch.concatenate([p2_knn_points, p2_knn_feats], dim=-1) # (b, n_points, k, d_points + in_feats)
         x = self.fc(x) # (b, n_points, k ,out_feats)
         x = x.permute(0, 3, 2, 1) # (b, out_feats, k, n_points)
         x = F.gelu(self.bn(x))
-        
         # (b, n_points, out_feats)
         x = torch.max(x, dim=2).values
         x = x.permute(0, 2, 1)
@@ -203,7 +223,7 @@ class PointTransformer(nn.Module):
         return feats
         
         
-points = torch.rand(4, 4096, 3).cuda()
-model = PointTransformer().cuda()
-feats = model(points)
-print(feats.shape)
+# points = torch.rand(8, 4096, 3).cuda()
+# model = PointTransformer().cuda()
+# feats = model(points)
+# print(feats.shape, feats)
