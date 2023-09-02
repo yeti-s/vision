@@ -46,16 +46,17 @@ def knn_point_sampling(ref, query, k, buffer_size = DEFAULT_KNN_BUFFER_SIZE):
     while s_idx < q_n:
         e_idx = q_n if e_idx > q_n else e_idx
         
-        knn_dist, knn_idx = knn(ref, query[:,])
+        knn_dist, knn_idx = knn(ref, query[:,s_idx:e_idx,:])
         knn_dist_list.append(knn_dist)
         knn_idx_list.append(knn_idx)
-        # torch.cuda.empty_cache()
+        torch.cuda.empty_cache()
         
-        s_idx = q_n
+        s_idx = e_idx
         e_idx += batch_size
          
     dist = torch.concatenate(knn_dist_list,dim=1).to(device)
     idx = torch.concatenate(knn_idx_list, dim=1).to(device)
+    torch.cuda.empty_cache()
     
     return dist, idx
 
@@ -300,12 +301,13 @@ class PointTransformer(nn.Module):
 
 
 class PointTransformerSeg(nn.Module):
-    def __init__(self, d_out, d_points = 3, k = 16) -> None:
+    def __init__(self, d_in, d_out, d_points = 3, k = 16) -> None:
         super(PointTransformerSeg, self).__init__()
         
         d_feats = 32
+        self.d_in = d_in
         self.d_points = d_points
-        self.mlp1 = SingleMLP(d_points, d_feats)
+        self.mlp1 = SingleMLP(d_in, d_feats)
         self.transformer1 = PointTransformerBlock(d_points, d_feats, k)
         
         down_blocks = []
@@ -323,7 +325,8 @@ class PointTransformerSeg(nn.Module):
     
     def forward(self, x):
         points = x[:,:,:self.d_points]
-        feats = self.mlp1(points)
+        feats = x[:,:,:self.d_in]
+        feats = self.mlp1(feats)
         feats, points = self.transformer1(feats, points)
         
         out_feats, out_points = [feats], [points]
@@ -352,7 +355,7 @@ class PointTransformerSeg(nn.Module):
 # feats = model(points)
 # print(feats.shape, feats)
 
-points = torch.rand(8, 9192, 3).cuda()
-model = PointTransformerSeg(2).cuda()
-feats = model(points)
-print(feats.shape)
+# points = torch.rand(1, 52584, 4).cuda()
+# model = PointTransformerSeg(4, 2).cuda()
+# feats = model(points)
+# print(feats.shape)
