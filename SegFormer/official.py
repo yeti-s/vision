@@ -2,7 +2,39 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+
+
 # code from https://github.com/NVlabs/SegFormer/tree/master
+
+class DepthWiseConv(nn.Module):
+    def __init__(self, inChannels, outChannels, kernel_size, stride=1, padding=0, dilation=1, bias=True):
+        super(DepthWiseConv, self).__init__()
+        self.kernel_size = kernel_size
+
+        if self.kernel_size != 1:
+            self.depthwise = ConvModule(inChannels, inChannels, kernel_size=kernel_size,
+                                        stride=stride,  padding=padding, dilation=dilation, groups=inChannels, bias=bias)
+        self.pointwise = ConvModule(inChannels, outChannels, kernel_size=1, bias=bias)
+
+    def forward(self, x):
+        if self.kernel_size != 1:
+            x = self.depthwise(x)
+        out = self.pointwise(x)
+        return out
+
+class ConvModule(nn.Module):
+    def __init__(self, inChannels, outChannels, kernel_size, stride=1, padding=0, dilation=1, groups=1, bias=True, act_layer=nn.ReLU):
+        super().__init__()
+        self.conv = nn.Conv2d(inChannels, outChannels, kernel_size=kernel_size,
+                              stride=stride, padding=padding, dilation=dilation, groups=groups, bias=bias)
+        self.norm = nn.BatchNorm2d(outChannels)
+        self.act = act_layer()
+    
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.norm(x)
+        x = self.act(x)
+        return x
 
 class DWConv(nn.Module):
     def __init__(self, dim=768):
@@ -317,7 +349,94 @@ class SegFormerHead(nn.Module):
         x = self.linear_pred(x) # 4th step predict classes
 
         return x
+
+class ASPPModule(nn.ModuleList):
+    """Atrous Spatial Pyramid Pooling (ASPP) Module.
+    """
+
+    def __init__(self, dilations, inChannels, embed_dim):
+        super(ASPPModule, self).__init__()
+        self.dilations = dilations
+        self.inChannels = inChannels
+        self.embed_dim = embed_dim
+        for dilation in dilations:
+            self.append(
+                DepthWiseConv(
+                    self.inChannels,
+                    self.embed_dim,
+                    kernel_size=1 if dilation == 1 else 3,
+                    dilation=dilation,
+                    padding=0 if dilation == 1 else dilation,
+                    bias=False))
+         
+    def forward(self, x):
+        """Forward function."""
+        aspp_outs = []
+        for aspp_module in self:
+            aspp_outs.append(aspp_module(x))
+
+        return aspp_outs
+
+class DAFormerHead(nn.Module):
+
+    def __init__(self, inChannels=[64, 128, 320, 512], dilation_rates=[1, 6, 12, 18],
+                dropout_ratio=0.1, act_layer=nn.ReLU, num_classes=19, embed_dim=256,
+                align_corners=False):
+
+        super().__init__()
+        # 1st step embed each Fi to same number of channels Ce
+
+        self.linear_c = nn.ModuleList([
+                                MLP(inputDim=inChannel, embed_dim=embed_dim)
+                                for inChannel in inChannels
+                            ])
+        # 2nd step is resizing 
+        ## so in forward
+        # 3rd step is applying ASPP module
+        self.aspp = ASPPModule(dilation_rates, embed_dim*4, embed_dim)
+        # 4ht step is concating and fusing
+        self.fuse = ConvModule(embed_dim*len(dilation_rates), embed_dim, kernel_size=3, bias=False)
+        # final prediction
+        self.cls_conv = nn.Sequential(nn.Dropout2d(p=0.1),
+                                      nn.Conv2d(embed_dim, num_classes, kernel_size=1))
+        
     
+    def forward(self, inputs, height, width):
+        
+        c1, c2, c3, c4 = inputs
+        N = c4.shape[0]
+        # 1st
+        features = []
+        for i, c in enumerate([c1, c2, c3, c4]):
+            feat = self.linear_c[i](c).permute(0,2,1).reshape(N, -1, c.shape[2], c.shape[3])
+            features.append(feat)
+        # 2nd
+        features = [resize(feature, size=features[0].shape[2:], mode='bilinear') for feature in features]
+        features = torch.cat(features, dim=1)
+        # 3rd
+        aspp_outs = self.aspp(features)
+        aspp_outs = torch.cat(aspp_outs, dim=1)
+        # 4th
+        fused = self.fuse(aspp_outs)
+        
+        fused = F.upsample_bilinear(fused, size=(height, width))
+        out = self.cls_conv(fused)
+
+        return out
+    
+
+class DAFormer(nn.Module):
+    def __init__(self, n_classes) -> None:
+        super(DAFormer, self).__init__()
+        
+        self.encoder = MixVisionTransformer(3)
+        self.decoder = DAFormerHead(num_classes=n_classes)
+        
+    def forward(self, x):
+        _, _, h, w = x.size()
+        feats = self.encoder(x)
+        return self.decoder(feats, h, w)
+
 class SegFormer(nn.Module):
     def __init__(self, n_classes) -> None:
         super().__init__()
@@ -330,6 +449,6 @@ class SegFormer(nn.Module):
         feats = self.encoder(x)
         return self.decoder(feats, h, w)
 
-# model = SegFormer(2).cuda()
+# model = DAFormer(2).cuda()
 # t = torch.rand(2, 3, 1601, 256).cuda()
 # print(model(t).shape)
